@@ -200,6 +200,49 @@ impl App {
         Ok(yaml_file)
     }
 
+    /// Parse jsonc files as json by ignoring all kinds of comments 
+    pub fn read_jsonc<T> (&self, name: &str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut cleaned_jsonc = String::new();
+        let contents = self.read_file(name)?;
+        let mut chars = contents.chars().peekable();
+
+        while let Some(current_char) = chars.next() {
+            match current_char {
+                '/' if chars.peek() == Some(&'/') => {
+                    while let Some(&next_char) = chars.peek() {
+                        chars.next();
+                        if next_char == '\n' {
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            Some('*') if chars.peek() == Some(&'/') => {
+                                chars.next();
+                                break;
+                            }
+                            None => break,
+                            _ => continue,
+                        }
+                    }
+                }
+                _ => cleaned_jsonc.push(current_char),
+            }
+        };
+        println!("{}", cleaned_jsonc);
+        let value: T = serde_json::from_str(&cleaned_jsonc.as_str()).with_context(|| {
+            let relative_path = self.strip_source_path(Path::new(name)).unwrap();
+            format!("Error reading {} as JSONC", relative_path.to_str().unwrap())
+        })?;
+        Ok(value)
+    }
+
     /// Convert an absolute path to a path relative to the app source directory
     pub fn strip_source_path(&self, abs_path: &Path) -> Result<PathBuf> {
         let source_str = match self.source.to_str() {
@@ -269,6 +312,14 @@ mod tests {
         let value: Map<String, Value> = app.read_json("package.json")?;
         assert!(value.get("name").is_some());
         assert_eq!(value.get("name").unwrap(), "npm");
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_jsonc_file() -> Result<()> {
+        let app = App::new("./examples/deno-jsonc")?;
+        let value: Map<String, Value> = app.read_jsonc("deno.jsonc")?;
+        assert!(value.get("tasks").is_some());
         Ok(())
     }
 
