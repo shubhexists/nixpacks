@@ -1,4 +1,4 @@
-use self::{moon::Moon, nx::Nx, turborepo::Turborepo};
+use self::{moon::Moon, nx::Nx, spa::SpaProvider, turborepo::Turborepo};
 use super::Provider;
 use crate::nixpacks::plan::merge::Mergeable;
 use crate::nixpacks::{
@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 mod moon;
 mod nx;
+mod spa;
 mod turborepo;
 
 pub const NODE_OVERLAY: &str = "https://github.com/railwayapp/nix-npm-overlay/archive/main.tar.gz";
@@ -100,11 +101,27 @@ pub struct PackageJson {
     pub cache_directories: Option<Vec<String>>,
 }
 
+impl PackageJson {
+    /// searches dependencies and dev_dependencies in package.json for a given dependency
+    fn has_dependency(&self, dep: &str) -> bool {
+        if let Some(deps) = &self.dependencies {
+            if deps.contains_key(dep) {
+                return true;
+            }
+        } else if let Some(deps) = &self.dev_dependencies {
+            if deps.contains_key(dep) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct NodeProvider {}
 
 impl Provider for NodeProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "node"
     }
 
@@ -116,7 +133,6 @@ impl Provider for NodeProvider {
         // Setup
         let mut setup = Phase::setup(Some(NodeProvider::get_nix_packages(app, env)?));
         setup.set_nix_archive(NodeProvider::get_nix_archive(app)?);
-
         if NodeProvider::uses_node_dependency(app, "prisma") {
             setup.add_nix_pkgs(&[Pkg::new("openssl")]);
         }
@@ -203,9 +219,24 @@ impl Provider for NodeProvider {
         // Start
         let start = NodeProvider::get_start_cmd(app, env)?.map(StartPhase::new);
 
-        let mut plan = BuildPlan::new(&vec![setup, install, build], start);
-        plan.add_variables(NodeProvider::get_node_environment_variables());
+        let mut phases = vec![setup, install, build];
+        if let Some(caddy) = SpaProvider::caddy_phase(app, env) {
+            phases.push(caddy);
+        }
+        let is_spa = SpaProvider::is_spa(app);
 
+        let mut plan = BuildPlan::new(&phases, start);
+        if SpaProvider::caddy_phase(app, env).is_some() {
+            plan.add_static_assets(SpaProvider::static_assets());
+        }
+        plan.add_variables(NodeProvider::get_node_environment_variables());
+        if is_spa {
+            plan.add_variables(EnvironmentVariables::from([(
+                "NIXPACKS_SPA_OUTPUT_DIR".to_string(),
+                env.get_config_variable("SPA_OUT_DIR")
+                    .unwrap_or(SpaProvider::get_output_directory(app)),
+            )]));
+        }
         Ok(Some(plan))
     }
 }
@@ -299,6 +330,10 @@ impl NodeProvider {
             }
         }
 
+        if let Some(start) = SpaProvider::start_command(app, env) {
+            return Ok(Some(start));
+        }
+
         let package_manager = NodeProvider::get_package_manager(app);
         if NodeProvider::has_script(app, "start")? {
             return Ok(Some(format!("{package_manager} run start")));
@@ -368,15 +403,35 @@ impl NodeProvider {
     }
 
     pub fn get_package_manager(app: &App) -> String {
-        let mut pkg_manager = "npm";
-        if app.includes_file("pnpm-lock.yaml") {
-            pkg_manager = "pnpm";
-        } else if app.includes_file("yarn.lock") {
-            pkg_manager = "yarn";
-        } else if app.includes_file("bun.lockb") || app.includes_file("bun.lock") {
-            pkg_manager = "bun";
+        // Checks for the package manager in root's package.json
+        let package_json: PackageJson = app.read_json("package.json").unwrap_or_default();
+
+        // Attempt to identify the package manager from `package.json`
+        if let Some(pkg) = package_json
+            .package_manager
+            .as_deref()
+            .and_then(|p| p.split('@').next())
+        {
+            if matches!(pkg, "npm" | "pnpm" | "yarn" | "bun") {
+                return pkg.to_string();
+            }
         }
-        pkg_manager.to_string()
+
+        // Check for lockfiles to infer the package manager
+        if app.includes_file("pnpm-lock.yaml") {
+            return "pnpm".to_string();
+        }
+
+        if app.includes_file("yarn.lock") {
+            return "yarn".to_string();
+        }
+
+        if app.includes_file("bun.lockb") || app.includes_file("bun.lock") {
+            return "bun".to_string();
+        }
+
+        // fallbacks to npm
+        "npm".to_string()
     }
 
     pub fn get_package_manager_dlx_command(app: &App) -> String {
@@ -634,14 +689,18 @@ fn parse_node_version_into_pkg(node_version: &str) -> String {
         eprintln!("Warning: node version {node_version} is not valid, using default node version {default_node_pkg_name}");
         Range::parse(DEFAULT_NODE_VERSION.to_string()).unwrap()
     });
-    let mut available_node_versions = AVAILABLE_NODE_VERSIONS.to_vec();
+    let mut available_lts_node_versions = AVAILABLE_NODE_VERSIONS
+        .iter()
+        .filter(|v| *v % 2 == 0)
+        .collect::<Vec<_>>();
+
     // use newest node version first
-    available_node_versions.sort_by(|a, b| b.cmp(a));
-    for version_number in available_node_versions {
+    available_lts_node_versions.sort_by(|a, b| b.cmp(a));
+    for version_number in available_lts_node_versions {
         let version_range_string = format!("{version_number}.x.x");
         let version_range: Range = version_range_string.parse().unwrap();
         if version_range.allows_any(&range) {
-            return version_number_to_pkg(version_number);
+            return version_number_to_pkg(*version_number);
         }
     }
     default_node_pkg_name
@@ -716,6 +775,24 @@ mod test {
                 &Environment::default()
             )?,
             Pkg::new(version_number_to_pkg(DEFAULT_NODE_VERSION).as_str())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_latest_lts_version() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_nix_node_pkg(
+                &PackageJson {
+                    name: Some(String::default()),
+                    engines: Some(engines_node(">=18")),
+                    ..Default::default()
+                },
+                &App::new("examples/node")?,
+                &Environment::default()
+            )?,
+            Pkg::new(version_number_to_pkg(22).as_str())
         );
 
         Ok(())
@@ -1054,6 +1131,26 @@ mod test {
                 "./examples/node-monorepo/packages/client"
             )?)?,
             vec![String::new()]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_correct_package_manager_monorepo_root() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_package_manager(&App::new("examples/node-pnpm-monorepo")?),
+            "pnpm"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_correct_package_manager_monorepo_subpkg() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_package_manager(&App::new("examples/node-pnpm-monorepo/apps/docs")?),
+            "pnpm"
         );
 
         Ok(())
